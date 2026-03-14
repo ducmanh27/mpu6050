@@ -320,19 +320,464 @@ cat /sys/bus/i2c/devices/2-0068/uevent
 | Tránh conflict driver cũ | Dùng compatible string custom | ✓ DONE |
 
 ---
+## Day 2: Write Character Device Driver
 
-## Day 2: WRite Driver Code
 ---
 
 ## Mục tiêu
 
-
+Viết hoàn chỉnh một **I2C character device driver** cho MPU6050 — bao gồm thiết kế data structures, probe/remove, file operations (open/read/ioctl) và user space test app.
 
 ---
+
+## Phase 1: Thiết kế Data Structures
+
+### 1.1 Phân biệt 2 loại private data
+
+Driver cần 2 struct riêng biệt — tư duy theo **scope**:
+
 ```
-Bước 1 — Skeleton:     include headers, module_init/exit
-Bước 2 — i2c_driver:   of_device_id, i2c_device_id, probe/remove
-Bước 3 — Probe:        verify WHO_AM_I, alloc struct, init hardware
-Bước 4 — Char device:  alloc dev_t, cdev_init, class, device node
-Bước 5 — File ops:     open, read (14 bytes raw data), ioctl, release
+mpu6050drv_private_data   →   driver-level, tồn tại suốt vòng đời module
+                               1 instance duy nhất, khai báo global static
+
+mpu6050dev_private_data   →   per-device, tồn tại từ probe đến remove
+                               mỗi MPU6050 trên bus có 1 instance riêng
 ```
+
+### 1.2 `struct mpu6050drv_private_data`
+
+```c
+struct mpu6050drv_private_data {
+    int total_devices;       /* đếm số device đang được quản lý */
+    dev_t device_num_base;   /* base major:minor number cho toàn driver */
+    struct class *class;     /* device class dùng chung /sys/class/mpu6050_class */
+};
+
+static struct mpu6050drv_private_data mpu6050_drv_data;
+```
+
+Khai báo **global static** vì:
+- Khởi tạo trong `module_init()` — trước khi probe chạy
+- probe() cần truy cập để lấy `class` và `device_num_base`
+- Tồn tại đến khi `module_exit()`
+
+### 1.3 `struct mpu6050dev_private_data`
+
+```c
+struct mpu6050dev_private_data {
+    struct i2c_client *client;   /* I2C client — dùng trong read/ioctl để giao tiếp hardware */
+    dev_t dev_num;               /* major:minor number của device này */
+    struct cdev cdev;            /* embedded char device struct */
+    char buffer[14];             /* raw data buffer */
+    struct mutex lock;           /* bảo vệ I2C transaction */
+    struct device *device;       /* device node /dev/mpu6050-X */
+};
+```
+
+**Tại sao `struct cdev` được embedded thay vì dùng pointer?**
+
+```
+container_of(inode->i_cdev, struct mpu6050dev_private_data, cdev)
+    ↑
+    macro này yêu cầu cdev phải nằm VẬT LÝ trong struct
+    nếu dùng pointer → không thể dùng container_of
+```
+
+**Tại sao cần lưu `struct i2c_client *client`?**
+
+```
+open()   → container_of(inode->i_cdev) → lấy được dev_data
+read()   → cần gọi i2c_smbus_read_i2c_block_data(client, ...)
+ioctl()  → cần gọi i2c_smbus_write_byte_data(client, ...)
+           ↑
+           tất cả I2C API đều cần client → phải lưu trong dev_data
+```
+
+---
+
+## Phase 2: module_init() và module_exit()
+
+### 2.1 Phân chia trách nhiệm init vs probe
+
+```
+module_init()   →   chạy 1 lần khi insmod
+                    khởi tạo những thứ dùng chung toàn driver
+
+probe()         →   chạy mỗi khi kernel match được 1 device
+                    khởi tạo những thứ per-device
+```
+
+**Nếu có 2 con MPU6050 trên 2 bus khác nhau:**
+```
+module_init() chạy: 1 lần
+probe() chạy:       2 lần
+```
+
+### 2.2 module_init() — 3 việc theo thứ tự
+
+```
+1. alloc_chrdev_region()   →   cấp dải major:minor cho toàn driver
+2. class_create()          →   tạo /sys/class/mpu6050_class
+3. i2c_add_driver()        →   đăng ký driver với I2C subsystem
+                               → kernel bắt đầu gọi probe() khi match device
+```
+
+**Error handling — cleanup ngược thứ tự:**
+
+```
+alloc_chrdev_region fail  →  return lỗi
+class_create fail         →  unregister_chrdev_region → return lỗi
+i2c_add_driver fail       →  class_destroy → unregister → return lỗi
+```
+
+### 2.3 module_exit() — cleanup ngược thứ tự init
+
+```
+i2c_del_driver()              ←  đăng ký sau cùng, hủy trước
+class_destroy()
+unregister_chrdev_region()    ←  đăng ký đầu tiên, hủy sau cùng
+```
+
+---
+
+## Phase 3: probe() — Trái tim của driver
+
+### 3.1 Thứ tự đầy đủ trong probe()
+
+```
+1.  of_match_device()          →  verify DT compatible string match
+2.  devm_kzalloc()             →  alloc per-device struct
+3.  mutex_init()               →  init lock trước khi dùng
+4.  i2c_smbus_read_byte_data() →  đọc WHO_AM_I (0x75), verify = 0x68
+5.  DEVICE_RESET               →  reset chip về default state
+6.  msleep(100)                →  đợi reset hoàn thành
+7.  Wake up + CLKSEL           →  ghi PWR_MGMT_1, chọn PLL clock
+8.  msleep(10)                 →  đợi PLL stabilize
+9.  GYRO_CONFIG                →  set full scale range gyro
+10. ACCEL_CONFIG               →  set full scale range accel
+11. i2c_set_clientdata()       →  lưu dev_data vào client
+12. dev_data->client = client  →  lưu client vào dev_data
+13. dev_data->dev_num          →  tính device number = base + total
+14. cdev_init() + cdev_add()   →  đăng ký char device
+15. device_create()            →  tạo /dev/mpu6050-X
+16. total_devices++            →  cập nhật counter
+```
+
+### 3.2 Tại sao verify WHO_AM_I?
+
+```
+probe() được gọi khi compatible string match
+→ nhưng đây chỉ là software match (DTS)
+→ hardware thực tế có thể:
+    - chip bị lỗi
+    - dây nối sai
+    - chip giả
+→ đọc WHO_AM_I = 0x68 → xác nhận đúng chip vật lý
+```
+
+### 3.3 Tại sao cần i2c_set_clientdata()?
+
+```
+probe(struct i2c_client *client)
+    → alloc dev_data
+    → i2c_set_clientdata(client, dev_data)
+         ↓
+         lưu dev_data vào client->dev.driver_data
+
+remove(struct i2c_client *client)
+    → kernel chỉ truyền vào client
+    → KHÔNG có dev_data trực tiếp
+    → i2c_get_clientdata(client) → lấy lại dev_data
+```
+
+**So sánh 2 con đường lấy dev_data:**
+
+| Context | Con đường | API |
+|---|---|---|
+| `open()` / `read()` / `ioctl()` | `inode->i_cdev` → `container_of` | `container_of` |
+| `remove()` | `i2c_client` → `driver_data` | `i2c_get_clientdata()` |
+
+### 3.4 Hardware init — đọc từ datasheet
+
+**PWR_MGMT_1 (0x6B):**
+```
+Bit 7 = DEVICE_RESET  →  set 1, chip tự clear khi xong
+Bit 6 = SLEEP         →  1 = sleep (default sau power-on), 0 = wake up
+Bit 0 = CLKSEL[0]     →  001 = PLL with X gyro reference (khuyến nghị)
+```
+
+Sequence chuẩn từ datasheet:
+```
+1. Ghi DEVICE_RESET = 1   →  reset toàn bộ register về default
+2. Wait 100ms              →  đợi reset xong (từ datasheet note SPI)
+3. Ghi SLEEP=0, CLKSEL=1  →  wake up + chọn clock ổn định hơn
+4. Wait 10ms               →  đợi PLL lock
+```
+
+**GYRO_CONFIG (0x1B) — bits [4:3] = FS_SEL:**
+```
+00 = ±250°/s   sensitivity = 131 LSB/°/s
+01 = ±500°/s   sensitivity = 65.5 LSB/°/s   ← driver dùng default này
+10 = ±1000°/s  sensitivity = 32.8 LSB/°/s
+11 = ±2000°/s  sensitivity = 16.4 LSB/°/s
+```
+
+**ACCEL_CONFIG (0x1C) — bits [4:3] = AFS_SEL:**
+```
+00 = ±2g   sensitivity = 16384 LSB/g   ← driver dùng default này
+01 = ±4g   sensitivity = 8192  LSB/g
+10 = ±8g   sensitivity = 4096  LSB/g
+11 = ±16g  sensitivity = 2048  LSB/g
+```
+
+### 3.5 Error handling trong probe()
+
+```
+Trước cdev_add:
+    → chỉ cần return lỗi
+    → devm_kzalloc tự cleanup memory
+
+Sau cdev_add, trước device_create:
+    → cdev_del() trước khi return
+
+Sau device_create:
+    → device_destroy() + cdev_del() trước khi return
+```
+
+---
+
+## Phase 4: remove()
+
+### 4.1 Thứ tự cleanup
+
+```
+1. i2c_get_clientdata()    →  lấy lại dev_data từ client
+2. put chip to sleep       →  best effort, KHÔNG return nếu fail
+3. device_destroy()        →  xóa /dev/mpu6050-X
+4. cdev_del()              →  hủy đăng ký char device
+5. total_devices--         →  cập nhật counter
+```
+
+**Nguyên tắc quan trọng trong remove():**
+
+```
+Hardware cleanup   →   best effort
+                       nếu chip không trả lời → log warning, tiếp tục
+                       KHÔNG return sớm
+
+Kernel cleanup     →   bắt buộc hoàn thành
+                       device_destroy, cdev_del phải được gọi
+                       dù hardware có fail hay không
+```
+
+Lý do: chip có thể bị rút dây trước khi rmmod — driver vẫn phải cleanup kernel resources.
+
+---
+
+## Phase 5: File Operations
+
+### 5.1 open()
+
+```
+inode->i_cdev
+    ↓
+container_of(inode->i_cdev, struct mpu6050dev_private_data, cdev)
+    ↓
+filp->private_data = dev_data   ← lưu lại cho read/write/ioctl dùng
+```
+
+`open()` không tương tác hardware — chỉ thiết lập context cho các syscall sau.
+
+### 5.2 read() — đọc 14 bytes raw data
+
+**Thứ tự xử lý:**
+
+```
+1. Lấy dev_data từ filp->private_data
+2. Kiểm tra count >= sizeof(struct mpu6050_data)
+3. mutex_lock_interruptible()     ←  interruptible để Ctrl+C hoạt động
+4. i2c_smbus_read_i2c_block_data(client, 0x3B, 14, raw_buffer)
+5. Parse 14 bytes → struct mpu6050_data
+6. mutex_unlock()
+7. copy_to_user()
+8. return sizeof(struct mpu6050_data)
+```
+
+**Layout 14 bytes từ register 0x3B:**
+
+```
+Byte 0,1   →  ACCEL_X high, low   →  combine: (buf[0] << 8) | buf[1]
+Byte 2,3   →  ACCEL_Y high, low
+Byte 4,5   →  ACCEL_Z high, low
+Byte 6,7   →  TEMP high, low
+Byte 8,9   →  GYRO_X high, low
+Byte 10,11 →  GYRO_Y high, low
+Byte 12,13 →  GYRO_Z high, low
+```
+
+**Integer scaling — tránh float trong kernel:**
+
+```c
+/* Accel: đơn vị mg (milli-g), AFS_SEL=0, sensitivity=16384 LSB/g */
+accel_x_mg = (raw_accel_x * 1000) / 16384
+
+/* Gyro: đơn vị mdps (milli-degree/s), FS_SEL=1, sensitivity=65.5 */
+gyro_x_mdps = (raw_gyro_x * 10000) / 655   /* 655 = 65.5 × 10 */
+
+/* Temperature: đơn vị centi-celsius */
+temp_cc = (raw_temp * 100) / 340 + 3653    /* 3653 = 36.53 × 100 */
+```
+
+### 5.3 ioctl() — unlocked_ioctl
+
+**Tại sao dùng `unlocked_ioctl` thay vì `ioctl`?**
+
+```
+ioctl cũ         →  giữ Big Kernel Lock suốt quá trình → performance tệ
+                    bị remove từ kernel 2.6.36
+unlocked_ioctl   →  driver tự quản lý lock riêng → tốt hơn
+```
+
+**Validation trước khi xử lý:**
+
+```
+_IOC_TYPE(cmd) != MPU6050_MAGIC  →  return -ENOTTY  (sai driver)
+_IOC_NR(cmd) > MPU6050_IOC_MAXNR →  return -ENOTTY  (sai command)
+```
+
+**Phân biệt cách lấy data theo direction:**
+
+```
+_IO commands  (RESET, SLEEP, WAKE_UP):
+    arg không phải pointer → không get_user
+
+_IOW commands (SET_GYRO_RANGE, SET_ACCEL_RANGE):
+    arg là pointer đến data user muốn gửi xuống
+    → get_user(val, (u8 __user *)arg)   ← bên trong từng case
+
+_IOR commands (GET_GYRO_RANGE, GET_ACCEL_RANGE):
+    arg là pointer đến buffer user muốn nhận
+    → put_user(val, (u8 __user *)arg)   ← bên trong từng case
+```
+
+**Helper function `mpu6050_write_reg_bitfield()`:**
+
+```
+Vấn đề: nhiều ioctl chỉ muốn thay đổi 1 vài bits trong register
+        không muốn ảnh hưởng các bits khác
+
+Giải pháp: read → modify → write
+    1. Đọc giá trị hiện tại
+    2. Clear bits cần đổi bằng mask: old & ~mask
+    3. OR với giá trị mới: | (val & mask)
+    4. Chỉ ghi lại nếu giá trị thực sự thay đổi → tối ưu bus I2C
+```
+
+---
+
+## Phase 6: UAPI Header — Dùng chung kernel và user space
+
+### 6.1 Vấn đề nếu không có uapi header
+
+```
+Không có uapi header:
+    User space phải tự define lại tất cả ioctl commands
+    → tam sao thất bản
+    → user phải tìm hiểu internals của driver
+    → dễ sai nếu driver update mà user không cập nhật
+```
+
+### 6.2 Cấu trúc file
+
+```
+mpu6050_uapi.h   ←  PUBLIC: kernel + user space đều include
+    #ifdef __KERNEL__
+        #include <linux/ioctl.h>
+        #include <linux/types.h>
+    #else
+        #include <sys/ioctl.h>
+        #include <stdint.h>
+        typedef uint8_t __u8;
+        typedef int32_t __s32;
+    #endif
+    struct mpu6050_data { ... }
+    enum accel_range / gyro_range
+    ioctl command defines
+
+mpu6050.h        ←  PRIVATE: chỉ driver dùng
+    register addresses
+    bit masks / BIT() macros
+    internal defines
+```
+
+### 6.3 Ioctl command number encoding
+
+`_IOW(magic, nr, type)` encode 4 thông tin vào 32-bit:
+
+```
+bits [31:30] = direction   (read/write/none)
+bits [29:16] = size        (sizeof type — để kernel verify)
+bits [15:8]  = magic       (định danh driver)
+bits [7:0]   = nr          (số thứ tự command)
+```
+
+---
+
+## Phase 7: Test App
+
+### 7.1 Cấu trúc project
+
+```
+mpu6050-driver/
+    mpu6050.c          ← kernel driver
+    mpu6050.h          ← private header
+    mpu6050_uapi.h     ← public header
+    Makefile           ← cross compile
+    example/
+        main.c         ← user space test app
+        Makefile       ← cross compile với -static
+```
+
+### 7.2 Lý do compile static
+
+```
+Host machine:  glibc 2.34 (Ubuntu mới)
+BBB runtime:   glibc cũ hơn
+
+Binary linked dynamic → lỗi: GLIBC_2.34 not found
+Binary linked static  → tự chứa tất cả lib → chạy được mọi nơi
+```
+
+Thêm `-static` vào CFLAGS trong Makefile.
+
+### 7.3 Test sequence
+
+```
+1. open("/dev/mpu6050-0", O_RDWR)
+2. read() baseline
+3. SET_GYRO_RANGE → GET_GYRO_RANGE → verify PASS/FAIL
+4. SET_ACCEL_RANGE → GET_ACCEL_RANGE → verify PASS/FAIL
+5. RESET → read lại → verify về default
+6. SLEEP → WAKE_UP → read lại → verify hoạt động bình thường
+7. close()
+```
+
+---
+
+## Tổng kết — Checklist Day 2
+
+| Hạng mục | Chi tiết | Trạng thái |
+|---|---|---|
+| Data structures | drv_data (global) + dev_data (per-device) | ✓ DONE |
+| module_init | alloc_chrdev + class_create + i2c_add | ✓ DONE |
+| module_exit | cleanup ngược thứ tự init | ✓ DONE |
+| probe — WHO_AM_I | verify chip identity qua I2C | ✓ DONE |
+| probe — hardware init | reset + wake up + gyro/accel config | ✓ DONE |
+| probe — char device | cdev_init + cdev_add + device_create | ✓ DONE |
+| i2c_set_clientdata | lưu dev_data để remove() lấy lại | ✓ DONE |
+| remove | sleep chip + device_destroy + cdev_del | ✓ DONE |
+| open | container_of + filp->private_data | ✓ DONE |
+| read | mutex + i2c block read + parse + copy_to_user | ✓ DONE |
+| ioctl | validate magic/nr + get_user/put_user + bitfield write | ✓ DONE |
+| uapi header | __KERNEL__ guard, dùng chung 2 phía | ✓ DONE |
+| test app | 5 test cases, static link, PASS/FAIL report | ✓ DONE |
