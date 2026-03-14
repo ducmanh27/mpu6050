@@ -43,14 +43,9 @@
 #define MPU6050_PWR_MGMT_1_TEMP_DIS         BIT(3)
 #define MPU6050_PWR_MGMT_1_CLKSEL_PLL_X     BIT(0)
 
-struct mpu6050_data {
-    int32_t accel_x;        // đơn vị mg
-    int32_t accel_y;
-    int32_t accel_z;
-    int32_t temp_centicelsius;
-    int32_t gyro_x;         // đơn vị mdps
-    int32_t gyro_y;
-    int32_t gyro_z;
-};
+#define MPU6050_GYRO_CONFIG_FS_SEL_MASK    (BIT(4) | BIT(3))
+#define MPU6050_ACCEL_CONFIG_AFS_SEL_MASK  (BIT(4) | BIT(3))
+#define MPU6050_SLEEP_CONFIG_MASK           (BIT(6))
+#define MPU6050_CLKSEL_MASK           (BIT(2) | BIT(1) | BIT(0))
 
 #endif

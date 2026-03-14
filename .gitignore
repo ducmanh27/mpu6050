@@ -1,0 +1,34 @@
+# --- Kernel Module Build Artifacts ---
+*.ko
+*.mod.c
+*.mod
+*.o
+*.o.cmd
+*.ko.cmd
+*.mod.o.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+.cache.mk
+
+# --- Kernel Build Temporary Files ---
+.*.cmd
+.tmp_*
+/arch/arm/boot/dts/*.dtb
+
+# --- User-space Test Apps ---
+# Giả sử bạn đặt tên file app là test_mpu6050
+test_mpu6050
+*.out
+*.a
+
+# --- IDE & Editor Files ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# --- Project Specific ---
+# Bỏ qua các file log hoặc file tạm tạo ra trong lúc chạy
+*.log

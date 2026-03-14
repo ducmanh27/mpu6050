@@ -4,7 +4,7 @@
 #include<linux/device.h>
 #include<linux/kdev_t.h>
 #include<linux/uaccess.h>
-#include <linux/platform_device.h>
+#include<linux/platform_device.h>
 #include<linux/slab.h>
 #include<linux/mod_devicetable.h>
 #include<linux/of.h>
@@ -13,6 +13,7 @@
 #include<linux/mutex.h>
 #include <linux/delay.h>
 
+#include"mpu6050_uapi.h"
 #include "mpu6050.h"
 
 #undef pr_fmt
@@ -162,13 +163,173 @@ ssize_t mpu6050_write(struct file *filp, const char __user *buff, size_t count, 
 	return 0;
 }
 
+/* Must be called with dev_data->lock held */
+static int mpu6050_write_reg_bitfield(struct i2c_client *client, u8 reg, u8 mask, u8 val)
+{
+    int ret;
+    u8 old_val, new_val;
+
+    /* 1. Đọc giá trị hiện tại từ thanh ghi */
+    ret = i2c_smbus_read_byte_data(client, reg);
+    if (ret < 0)
+        return ret;
+
+    old_val = (u8)ret;
+
+    /* 2. Tính toán giá trị mới: Xóa bit cũ bằng mask và OR với giá trị mới */
+    new_val = (old_val & ~mask) | (val & mask);
+
+    /* 3. Chỉ ghi lại nếu giá trị thực sự thay đổi (Tối ưu bus I2C) */
+    if (old_val == new_val)
+        return 0;
+
+    return i2c_smbus_write_byte_data(client, reg, new_val);
+}
+
+static const u8 gyro_range_values[] = {
+    MPU6050_GYRO_CONFIG_FS_SEL_250,  
+    MPU6050_GYRO_CONFIG_FS_SEL_500,
+    MPU6050_GYRO_CONFIG_FS_SEL_1000, 
+    MPU6050_GYRO_CONFIG_FS_SEL_2000 
+};
+
+static const u8 accel_range_values[] = {
+    MPU6050_ACCEL_CONFIG_AFS_SEL_2,  
+    MPU6050_ACCEL_CONFIG_AFS_SEL_4,
+    MPU6050_ACCEL_CONFIG_AFS_SEL_8, 
+    MPU6050_ACCEL_CONFIG_AFS_SEL_16 
+};
+
+long mpu6050_ioctl (struct file *filp, unsigned int cmd, unsigned long arg) {
+
+    int ret = 0;
+    struct mpu6050dev_private_data* mpu6050dev_data;
+    u8 val;
+
+    if (_IOC_TYPE(cmd) != MPU6050_MAGIC)
+        return -ENOTTY;
+
+    if (_IOC_NR(cmd) > MPU6050_IOC_MAXNR)
+        return -ENOTTY;
+
+    if (_IOC_DIR(cmd) & _IOC_WRITE) {
+        if (get_user(val, (u8 __user *)arg))
+            return -EFAULT;
+    }   
+
+    mpu6050dev_data = (struct mpu6050dev_private_data*)filp->private_data;
+
+    if (mutex_lock_interruptible(
+        &mpu6050dev_data->lock))
+        return -ERESTARTSYS;
+    switch (cmd)
+    {
+    case MPU6050_IOC_RESET:
+        ret = i2c_smbus_write_byte_data(mpu6050dev_data->client, 
+            MPU6050_PWR_MGMT_1_REG, 
+            MPU6050_PWR_MGMT_1_DEVICE_RESET
+        );
+        if (ret < 0) goto unlock_out;
+        msleep(100); 
+        ret = i2c_smbus_write_byte_data(mpu6050dev_data->client, 
+            MPU6050_PWR_MGMT_1_REG, 
+            MPU6050_PWR_MGMT_1_CLKSEL_PLL_X
+        );
+        break;
+
+    case MPU6050_IOC_SLEEP:
+        ret = mpu6050_write_reg_bitfield( mpu6050dev_data->client, 
+            MPU6050_PWR_MGMT_1_REG, 
+            MPU6050_SLEEP_CONFIG_MASK, 
+            MPU6050_PWR_MGMT_1_SLEEP
+        );
+        break;
+
+    case MPU6050_IOC_WAKE_UP:
+        ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client, 
+            MPU6050_PWR_MGMT_1_REG, 
+            MPU6050_SLEEP_CONFIG_MASK, 0
+        );
+        if (ret < 0) goto unlock_out;
+        msleep(100);
+        ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client,
+            MPU6050_PWR_MGMT_1_REG,
+            MPU6050_CLKSEL_MASK,
+            MPU6050_PWR_MGMT_1_CLKSEL_PLL_X);
+        break;
+
+    case MPU6050_IOC_SET_ACCEL_RANGE:
+        if (val > 3) {
+            ret = -EINVAL;
+            goto unlock_out;
+        }
+            ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client, 
+                                            MPU6050_ACCEL_CONFIG_REG, 
+                                            MPU6050_ACCEL_CONFIG_AFS_SEL_MASK, 
+                                            accel_range_values[val]);
+        break;
+
+    case MPU6050_IOC_SET_GYRO_RANGE:
+        if (val > 3) {
+            ret = -EINVAL;
+            goto unlock_out;
+        }
+            ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client, 
+                                            MPU6050_GYRO_CONFIG_REG, 
+                                            MPU6050_GYRO_CONFIG_FS_SEL_MASK, 
+                                            gyro_range_values[val]);
+        break;
+
+    case MPU6050_IOC_GET_CONFIG:
+        ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_CONFIG_REG);
+        if (ret < 0) goto unlock_out;
+        if (put_user(ret, (u8 __user *)arg)) {
+            ret = -EFAULT;
+            goto unlock_out;
+        }
+        break;
+
+    case MPU6050_IOC_GET_ACCEL_RANGE:
+        ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_ACCEL_CONFIG_REG);
+        if (ret < 0) goto unlock_out;
+        val = (u8)((ret & MPU6050_ACCEL_CONFIG_AFS_SEL_MASK) >> 3);
+        if (put_user(val, (u8 __user *)arg)) {
+            ret = -EFAULT;
+            goto unlock_out;
+        }
+        ret = 0;
+        break;
+
+    case MPU6050_IOC_GET_GYRO_RANGE:
+        ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_GYRO_CONFIG_REG);
+        if (ret < 0) goto unlock_out;
+        val = (u8) ((ret & MPU6050_GYRO_CONFIG_FS_SEL_MASK) >> 3);
+        if (put_user(val, (u8 __user *)arg)) {
+            ret = -EFAULT;
+            goto unlock_out;
+        }
+        ret = 0;
+        break;
+
+    default:
+        ret = -ENOTTY;
+        break;
+    }
+
+unlock_out:
+    mutex_unlock(&mpu6050dev_data->lock);
+    return (long)ret;
+}
+
+
 struct file_operations mpu6050_ops = {
 	.open = mpu6050_open,
 	.release = mpu6050_release,
 	.read = mpu6050_read,
 	.write = mpu6050_write,
 	.llseek = mpu6050_lseek,
-	.owner = THIS_MODULE
+	.owner = THIS_MODULE,
+    .unlocked_ioctl = mpu6050_ioctl
 };
 
 
@@ -232,11 +393,17 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
     // 1. Cấu hình Gyro: Chọn ± 500 °/s (FS_SEL = 1) 
     // Giá trị: 000 01 000 = 0x08
     ret = i2c_smbus_write_byte_data(client, MPU6050_GYRO_CONFIG_REG, MPU6050_GYRO_CONFIG_FS_SEL_500);
-
+    if (ret < 0) {
+    dev_err(dev, "Gyro config failed\n");
+        return ret;
+    }
     // 2. Cấu hình Accel: Chọn ± 2g (AFS_SEL = 0) */
     // Giá trị: 000 00 000 = 0x00
-    i2c_smbus_write_byte_data(client, MPU6050_ACCEL_CONFIG_REG, MPU6050_ACCEL_CONFIG_AFS_SEL_2);
-
+    ret  = i2c_smbus_write_byte_data(client, MPU6050_ACCEL_CONFIG_REG, MPU6050_ACCEL_CONFIG_AFS_SEL_2);
+    if (ret < 0) {
+    dev_err(dev, "Accel config failed\n");
+        return ret;
+    }
     i2c_set_clientdata(client, dev_data);
 
     dev_data->client = client;
@@ -277,8 +444,7 @@ int mpu6050_i2c_driver_remove(struct i2c_client *client) {
 
     ret = i2c_smbus_write_byte_data(client, MPU6050_PWR_MGMT_1_REG, MPU6050_PWR_MGMT_1_SLEEP);
     if (ret < 0) {
-        dev_err(&client->dev, "Configure failed\n");
-        return ret;
+        dev_warn(&client->dev, "Failed to sleep chip, hardware may be unavailable\n");
     }
 
 	/*1. Remove a device that was created with device_create() */
