@@ -10,6 +10,8 @@
 #define MPU6050_WHO_AM_I_VALUE          0x68
 #define MPU6050_PWR_MGMT_1_REG          0x6B
 
+#define MPU6050_INT_PIN_CFG_REG         0x37
+#define MPU6050_INT_ENABLE_REG          0x38
 #define MPU6050_ACCEL_XOUT_H_REG        0x3B
 #define MPU6050_ACCEL_XOUT_L_REG        0x3C
 #define MPU6050_ACCEL_YOUT_H_REG        0x3D
@@ -24,7 +26,6 @@
 #define MPU6050_GYRO_YOUT_L_REG         0x46
 #define MPU6050_GYRO_ZOUT_H_REG         0x47
 #define MPU6050_GYRO_ZOUT_L_REG         0x48
-
 #define MPU6050_DATA_START_REG    0x3B
 #define MPU6050_DATA_LEN          14
 

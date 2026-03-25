@@ -1,19 +1,22 @@
-#include<linux/module.h>
-#include<linux/fs.h>
-#include<linux/cdev.h>
-#include<linux/device.h>
-#include<linux/kdev_t.h>
-#include<linux/uaccess.h>
-#include<linux/platform_device.h>
-#include<linux/slab.h>
-#include<linux/mod_devicetable.h>
-#include<linux/of.h>
-#include<linux/of_device.h>
-#include<linux/i2c.h>
-#include<linux/mutex.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/kdev_t.h>
+#include <linux/uaccess.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/mod_devicetable.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/i2c.h>
+#include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/spinlock.h>
+#include <linux/poll.h>
 
-#include"mpu6050_uapi.h"
+#include "mpu6050_uapi.h"
 #include "mpu6050.h"
 
 #undef pr_fmt
@@ -28,14 +31,18 @@ struct mpu6050dev_private_data {
 	struct cdev cdev;
     char buffer[14];
     struct mutex lock;
+    wait_queue_head_t read_queue;
     struct device *device;
+    int irq_num;
+    bool data_ready;
+    spinlock_t s_lock;
+    struct mpu6050_data cooked_data;
 };
 
 struct mpu6050drv_private_data {
     int total_devices;
     dev_t device_num_base;
     struct class *class;
-
 };
 
 static struct mpu6050drv_private_data mpu6050_drv_data;
@@ -72,95 +79,45 @@ int mpu6050_release(struct inode *inode, struct file *flip)
 
 ssize_t mpu6050_read(struct file *filp, char __user *buff, size_t count, loff_t *f_pos)
 {
-    int ret;
-    u8 raw_buffer[MPU6050_DATA_LEN];
-    int16_t raw_accel_x;
-    int16_t raw_accel_y;
-    int16_t raw_accel_z;
-    int16_t temp_raw;
-    int16_t raw_gyro_x;
-    int16_t raw_gyro_y;
-    int16_t raw_gyro_z;
-    struct mpu6050_data mpu6060_data;
     struct mpu6050dev_private_data* mpu6050dev_data = (struct mpu6050dev_private_data*)filp->private_data;
 
     if (count < sizeof(struct mpu6050_data)) {
         return -EINVAL;
     }
-    
-    // mutex_lock(&mpu6050dev_data->lock);
-    if (mutex_lock_interruptible(&mpu6050dev_data->lock)) {
-        return -EINTR;
-    }
-    
-    ret = i2c_smbus_read_i2c_block_data(mpu6050dev_data->client, MPU6050_DATA_START_REG, 
-                                     MPU6050_DATA_LEN, raw_buffer);
 
-    if (ret < 0) {
-        dev_err(&mpu6050dev_data->client->dev, "I2C block read failed: %d\n", ret);
+    if ((filp->f_flags & O_NONBLOCK) && !mpu6050dev_data->data_ready)
+        return -EAGAIN;
+
+    if (wait_event_interruptible(mpu6050dev_data->read_queue, mpu6050dev_data->data_ready))
+        return -ERESTARTSYS;
+
+    if (mutex_lock_interruptible(&mpu6050dev_data->lock))
+            return -EINTR;
+
+    if(copy_to_user(buff, &mpu6050dev_data->cooked_data, sizeof(struct mpu6050_data))){
         mutex_unlock(&mpu6050dev_data->lock);
-        return ret;
-    }
-
-    raw_accel_x = (int16_t)((raw_buffer[0] << 8) | raw_buffer[1]);
-    mpu6060_data.accel_x = ((int32_t)raw_accel_x * 1000) / 16384;
-
-    raw_accel_y = (int16_t)((raw_buffer[2] << 8) | raw_buffer[3]);
-    mpu6060_data.accel_y = ((int32_t)raw_accel_y * 1000) / 16384;
-
-    raw_accel_z = (int16_t)((raw_buffer[4] << 8) | raw_buffer[5]);
-    mpu6060_data.accel_z = ((int32_t)raw_accel_z * 1000) / 16384;
-
-    // Nhiệt độ (Register 0x41 và 0x42)
-    temp_raw = (int16_t)((raw_buffer[6] << 8) | raw_buffer[7]);
-    mpu6060_data.temp_centicelsius = ((int32_t)temp_raw * 100) / 340 + 3653;
-
-    // Gyroscope (Register 0x43 đến 0x48)
-    // gyro_mdps = gyro_raw * 1000 * 10 / 655
-    raw_gyro_x = (int16_t)((raw_buffer[8] << 8) | raw_buffer[9]);
-    mpu6060_data.gyro_x  = ((int32_t)raw_gyro_x * 10000) / 655;
-
-    raw_gyro_y = (int16_t)((raw_buffer[10] << 8) | raw_buffer[11]);
-    mpu6060_data.gyro_y  = ((int32_t)raw_gyro_y * 10000) / 655;
-
-    raw_gyro_z = (int16_t)((raw_buffer[12] << 8) | raw_buffer[13]);
-    mpu6060_data.gyro_z  = ((int32_t)raw_gyro_z * 10000) / 655;
-
-    dev_info(&mpu6050dev_data->client->dev,
-        "raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-        raw_buffer[0], raw_buffer[1], raw_buffer[2], raw_buffer[3],
-        raw_buffer[4], raw_buffer[5], raw_buffer[6], raw_buffer[7],
-        raw_buffer[8], raw_buffer[9], raw_buffer[10], raw_buffer[11],
-        raw_buffer[12], raw_buffer[13]);
-    // accel_mg = accel_raw * 1000 / 16384
-
-    mutex_unlock(&mpu6050dev_data->lock);
-    dev_info(&mpu6050dev_data->client->dev, 
-        "Accel: x=%d mg, y=%d mg, z=%d mg\n",
-        mpu6060_data.accel_x,
-        mpu6060_data.accel_y,
-        mpu6060_data.accel_z);
-
-    dev_info(&mpu6050dev_data->client->dev,
-        "Gyro: x=%d mdps, y=%d mdps, z=%d mdps\n",
-        mpu6060_data.gyro_x,
-        mpu6060_data.gyro_y,
-        mpu6060_data.gyro_z);
-
-    dev_info(&mpu6050dev_data->client->dev,
-        "Temp: %d centi-celsius\n",
-        mpu6060_data.temp_centicelsius);
-    if(copy_to_user(buff, &mpu6060_data, sizeof(struct mpu6050_data))){
 		return -EFAULT;
 	}
-    dev_info(&mpu6050dev_data->client->dev,
-        "sizeof mpu6050_data = %zu\n", sizeof(struct mpu6050_data));
+
+    mpu6050dev_data->data_ready = false;
+    mutex_unlock(&mpu6050dev_data->lock);
+
 	return sizeof(struct mpu6050_data);
 }
 
 ssize_t mpu6050_write(struct file *filp, const char __user *buff, size_t count, loff_t *f_pos)
 {
 	return 0;
+}
+__poll_t mpu6050_poll(struct file *filp, struct poll_table_struct *wait) {
+    struct mpu6050dev_private_data *mpu6050dev_data = (struct mpu6050dev_private_data*)filp->private_data;
+    unsigned int mask = 0;
+
+    poll_wait(filp, &mpu6050dev_data->read_queue, wait);
+    if (mpu6050dev_data->data_ready)
+        mask |= POLLIN | POLLRDNORM;
+
+    return mask;
 }
 
 /* Must be called with dev_data->lock held */
@@ -200,7 +157,7 @@ static const u8 accel_range_values[] = {
     MPU6050_ACCEL_CONFIG_AFS_SEL_16 
 };
 
-long mpu6050_ioctl (struct file *filp, unsigned int cmd, unsigned long arg) {
+long mpu6050_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
     int ret = 0;
     struct mpu6050dev_private_data* mpu6050dev_data;
@@ -321,6 +278,64 @@ unlock_out:
     return (long)ret;
 }
 
+static irqreturn_t mpu6050_primary_handler(int irq, void *dev_id) {
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t mpu6050_threaded_handler(int irq, void *dev_id)
+{
+    struct mpu6050dev_private_data *mpu6050dev_data = dev_id;
+    int ret;
+    u8 raw_buffer[MPU6050_DATA_LEN];
+    int16_t raw_accel_x;
+    int16_t raw_accel_y;
+    int16_t raw_accel_z;
+    int16_t temp_raw;
+    int16_t raw_gyro_x;
+    int16_t raw_gyro_y;
+    int16_t raw_gyro_z;
+
+    mutex_lock(&mpu6050dev_data->lock);
+    
+    ret = i2c_smbus_read_i2c_block_data(mpu6050dev_data->client, MPU6050_DATA_START_REG, 
+                                     MPU6050_DATA_LEN, raw_buffer);
+
+    if (ret < 0) {
+        dev_err(&mpu6050dev_data->client->dev, "I2C block read failed: %d\n", ret);
+        mutex_unlock(&mpu6050dev_data->lock);
+        return IRQ_HANDLED;
+    }
+
+    raw_accel_x = (int16_t)((raw_buffer[0] << 8) | raw_buffer[1]);
+    mpu6050dev_data->cooked_data.accel_x = ((int32_t)raw_accel_x * 1000) / 16384;
+
+    raw_accel_y = (int16_t)((raw_buffer[2] << 8) | raw_buffer[3]);
+    mpu6050dev_data->cooked_data.accel_y = ((int32_t)raw_accel_y * 1000) / 16384;
+
+    raw_accel_z = (int16_t)((raw_buffer[4] << 8) | raw_buffer[5]);
+    mpu6050dev_data->cooked_data.accel_z = ((int32_t)raw_accel_z * 1000) / 16384;
+
+    // Nhiệt độ (Register 0x41 và 0x42)
+    temp_raw = (int16_t)((raw_buffer[6] << 8) | raw_buffer[7]);
+    mpu6050dev_data->cooked_data.temp_centicelsius = ((int32_t)temp_raw * 100) / 340 + 3653;
+
+    // Gyroscope (Register 0x43 đến 0x48)
+    // gyro_mdps = gyro_raw * 1000 * 10 / 655
+    raw_gyro_x = (int16_t)((raw_buffer[8] << 8) | raw_buffer[9]);
+    mpu6050dev_data->cooked_data.gyro_x  = ((int32_t)raw_gyro_x * 10000) / 655;
+
+    raw_gyro_y = (int16_t)((raw_buffer[10] << 8) | raw_buffer[11]);
+    mpu6050dev_data->cooked_data.gyro_y  = ((int32_t)raw_gyro_y * 10000) / 655;
+
+    raw_gyro_z = (int16_t)((raw_buffer[12] << 8) | raw_buffer[13]);
+    mpu6050dev_data->cooked_data.gyro_z  = ((int32_t)raw_gyro_z * 10000) / 655;
+
+    mutex_unlock(&mpu6050dev_data->lock);
+    mpu6050dev_data->data_ready = true;
+    wake_up_interruptible(&mpu6050dev_data->read_queue);
+    return IRQ_HANDLED;
+}
+
 
 struct file_operations mpu6050_ops = {
 	.open = mpu6050_open,
@@ -328,8 +343,9 @@ struct file_operations mpu6050_ops = {
 	.read = mpu6050_read,
 	.write = mpu6050_write,
 	.llseek = mpu6050_lseek,
-	.owner = THIS_MODULE,
-    .unlocked_ioctl = mpu6050_ioctl
+    .unlocked_ioctl = mpu6050_ioctl,
+    .poll = mpu6050_poll,
+    .owner = THIS_MODULE,
 };
 
 
@@ -345,10 +361,11 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
 
     const struct of_device_id *match;
     
+    int irq_num;
 
     pr_info("A device is detected\n");
 
-    match = of_match_device(of_match_ptr(mpu6050dev_dt_match),dev);
+    match = of_match_device(of_match_ptr(mpu6050dev_dt_match), dev);
 
     if(match) {
 		driver_data = match->data;
@@ -363,7 +380,20 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
 		return -ENOMEM;
 	}
 
+    irq_num = client->irq; 
+    
+    if (irq_num < 0) {
+        dev_err(&client->dev, "Failed to get IRQ number\n");
+        return irq_num;
+    }
+    
+
+    dev_data->irq_num = irq_num;
+
+    spin_lock_init(&dev_data->s_lock);
     mutex_init(&dev_data->lock);
+    init_waitqueue_head(&dev_data->read_queue);
+    dev_data->data_ready = false;
 
     ret = i2c_smbus_read_byte_data(client, MPU6050_WHO_AM_I_REG);
     if (ret < 0) {
@@ -383,6 +413,7 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
     }
 
     msleep(100); // Đợi chip reset xong
+    
     // 0x01: SLEEP=0, CYCLE=0, TEMP_DIS=0, CLKSEL=1
     ret = i2c_smbus_write_byte_data(client, MPU6050_PWR_MGMT_1_REG, MPU6050_PWR_MGMT_1_CLKSEL_PLL_X);
     if (ret < 0) {
@@ -404,9 +435,46 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
     dev_err(dev, "Accel config failed\n");
         return ret;
     }
+
+    ret  = i2c_smbus_write_byte_data(client, MPU6050_INT_PIN_CFG_REG, (1 << 4) | (0 << 5) | (0 << 6) | (1 << 7));
+    if (ret < 0) {
+    dev_err(dev, "Interrupt pin config failed\n");
+        return ret;
+    }
+
+    ret  = i2c_smbus_write_byte_data(client, MPU6050_INT_ENABLE_REG, (1 << 0));
+    if (ret < 0) {
+    dev_err(dev, "Interrupt enbale failed\n");
+        return ret;
+    } 
+
+    msleep(50);
+
+    // Sample Rate Divider = 0x63 (99 decimal)
+    // Công suất: Sample Rate = Internal_Sample_Rate / (1 + SMPLRT_DIV)
+    // Nếu Gyro là 1kHz, thì 1000 / (1 + 99) = 10Hz (10 ngắt mỗi giây)
+    i2c_smbus_write_byte_data(client, 0x19, 0x63); 
+
+    msleep(50);
+
+    // Cấu hình DLPF (Digital Low Pass Filter) để ổn định dữ liệu
+    // Thanh ghi 0x1A (CONFIG), set giá trị 0x03 (~42Hz bandwidth)
+    i2c_smbus_write_byte_data(client, 0x1A, 0x03);
+    
     i2c_set_clientdata(client, dev_data);
 
     dev_data->client = client;
+
+    ret = request_threaded_irq(client->irq, 
+                            mpu6050_primary_handler,   /* Top Half */
+                            mpu6050_threaded_handler,  /* Bottom Half */
+                            IRQF_TRIGGER_FALLING | IRQF_ONESHOT, 
+                            "mpu6050_event", 
+                            dev_data);
+    if (ret) {
+        dev_err(&client->dev, "Failed to register threaded irq\n");
+        return ret;
+    }
 
     dev_data->dev_num = mpu6050_drv_data.device_num_base + mpu6050_drv_data.total_devices;
 
@@ -417,6 +485,7 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
     ret = cdev_add(&dev_data->cdev, dev_data->dev_num, 1);
 	if(ret < 0){
 		dev_err(dev,"Cdev add failed\n");
+        free_irq(dev_data->irq_num, dev_data);
 		return ret;
 	}
 
@@ -424,8 +493,9 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
 								"mpu6050-%d", mpu6050_drv_data.total_devices);
 	if(IS_ERR(dev_data->device)){
 		dev_err(dev,"Device create failed\n");
-		ret = PTR_ERR(dev_data->device);
+        free_irq(dev_data->irq_num, dev_data);
 		cdev_del(&dev_data->cdev);
+        ret = PTR_ERR(dev_data->device);
 		return ret;
 	}
 
@@ -446,6 +516,7 @@ int mpu6050_i2c_driver_remove(struct i2c_client *client) {
     if (ret < 0) {
         dev_warn(&client->dev, "Failed to sleep chip, hardware may be unavailable\n");
     }
+    free_irq(dev_data->irq_num, dev_data);
 
 	/*1. Remove a device that was created with device_create() */
 	device_destroy(mpu6050_drv_data.class, dev_data->dev_num);
@@ -454,7 +525,7 @@ int mpu6050_i2c_driver_remove(struct i2c_client *client) {
 	cdev_del(&dev_data->cdev);
 
 	mpu6050_drv_data.total_devices--;
-
+    
     
 	dev_info(&client->dev,"A device is removed\n");
     return 0;
