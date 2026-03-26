@@ -307,28 +307,28 @@ static irqreturn_t mpu6050_threaded_handler(int irq, void *dev_id)
     }
 
     raw_accel_x = (int16_t)((raw_buffer[0] << 8) | raw_buffer[1]);
-    mpu6050dev_data->cooked_data.accel_x = ((int32_t)raw_accel_x * 1000) / 16384;
+    mpu6050dev_data->cooked_data.accel_x = ((int32_t)raw_accel_x * 1000) / MPU6050_ACCEL_SENSITIVITY_2G;
 
     raw_accel_y = (int16_t)((raw_buffer[2] << 8) | raw_buffer[3]);
-    mpu6050dev_data->cooked_data.accel_y = ((int32_t)raw_accel_y * 1000) / 16384;
+    mpu6050dev_data->cooked_data.accel_y = ((int32_t)raw_accel_y * 1000) / MPU6050_ACCEL_SENSITIVITY_2G;
 
     raw_accel_z = (int16_t)((raw_buffer[4] << 8) | raw_buffer[5]);
-    mpu6050dev_data->cooked_data.accel_z = ((int32_t)raw_accel_z * 1000) / 16384;
+    mpu6050dev_data->cooked_data.accel_z = ((int32_t)raw_accel_z * 1000) / MPU6050_ACCEL_SENSITIVITY_2G;
 
     // Nhiệt độ (Register 0x41 và 0x42)
     temp_raw = (int16_t)((raw_buffer[6] << 8) | raw_buffer[7]);
-    mpu6050dev_data->cooked_data.temp_centicelsius = ((int32_t)temp_raw * 100) / 340 + 3653;
+    mpu6050dev_data->cooked_data.temp_centicelsius = ((int32_t)temp_raw * 100) / MPU6050_TEMP_SENSITIVITY  + MPU6050_TEMP_OFFSET;
 
     // Gyroscope (Register 0x43 đến 0x48)
     // gyro_mdps = gyro_raw * 1000 * 10 / 655
     raw_gyro_x = (int16_t)((raw_buffer[8] << 8) | raw_buffer[9]);
-    mpu6050dev_data->cooked_data.gyro_x  = ((int32_t)raw_gyro_x * 10000) / 655;
+    mpu6050dev_data->cooked_data.gyro_x  = ((int32_t)raw_gyro_x * 10000) / MPU6050_GYRO_SENSITIVITY_500;
 
     raw_gyro_y = (int16_t)((raw_buffer[10] << 8) | raw_buffer[11]);
-    mpu6050dev_data->cooked_data.gyro_y  = ((int32_t)raw_gyro_y * 10000) / 655;
+    mpu6050dev_data->cooked_data.gyro_y  = ((int32_t)raw_gyro_y * 10000) / MPU6050_GYRO_SENSITIVITY_500;
 
     raw_gyro_z = (int16_t)((raw_buffer[12] << 8) | raw_buffer[13]);
-    mpu6050dev_data->cooked_data.gyro_z  = ((int32_t)raw_gyro_z * 10000) / 655;
+    mpu6050dev_data->cooked_data.gyro_z  = ((int32_t)raw_gyro_z * 10000) / MPU6050_GYRO_SENSITIVITY_500;
 
     mutex_unlock(&mpu6050dev_data->lock);
     mpu6050dev_data->data_ready = true;
@@ -436,30 +436,31 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
         return ret;
     }
 
-    ret  = i2c_smbus_write_byte_data(client, MPU6050_INT_PIN_CFG_REG, (1 << 4) | (0 << 5) | (0 << 6) | (1 << 7));
+    ret = i2c_smbus_write_byte_data(client,
+        MPU6050_INT_PIN_CFG_REG,
+        MPU6050_INT_LEVEL | MPU6050_INT_RD_CLEAR);
     if (ret < 0) {
     dev_err(dev, "Interrupt pin config failed\n");
         return ret;
     }
 
-    ret  = i2c_smbus_write_byte_data(client, MPU6050_INT_ENABLE_REG, (1 << 0));
+    ret = i2c_smbus_write_byte_data(client,
+        MPU6050_INT_ENABLE_REG,
+        MPU6050_DATA_RDY_EN);
     if (ret < 0) {
     dev_err(dev, "Interrupt enbale failed\n");
         return ret;
     } 
 
-    msleep(50);
+    // Sample rate 10Hz 
+    i2c_smbus_write_byte_data(client,
+        MPU6050_SMPRT_DIV_REG,
+        MPU6050_SMPRT_DIV_10HZ);
 
-    // Sample Rate Divider = 0x63 (99 decimal)
-    // Công suất: Sample Rate = Internal_Sample_Rate / (1 + SMPLRT_DIV)
-    // Nếu Gyro là 1kHz, thì 1000 / (1 + 99) = 10Hz (10 ngắt mỗi giây)
-    i2c_smbus_write_byte_data(client, 0x19, 0x63); 
-
-    msleep(50);
-
-    // Cấu hình DLPF (Digital Low Pass Filter) để ổn định dữ liệu
-    // Thanh ghi 0x1A (CONFIG), set giá trị 0x03 (~42Hz bandwidth)
-    i2c_smbus_write_byte_data(client, 0x1A, 0x03);
+    // DLPF 42Hz 
+    i2c_smbus_write_byte_data(client,
+        MPU6050_CONFIG_REG,
+        MPU6050_DLPF_CFG_42HZ);
     
     i2c_set_clientdata(client, dev_data);
 
@@ -511,6 +512,8 @@ int mpu6050_i2c_driver_remove(struct i2c_client *client) {
 	struct mpu6050dev_private_data  *dev_data = i2c_get_clientdata(client);
 
     int ret;
+    i2c_smbus_write_byte_data(client,
+        MPU6050_INT_ENABLE_REG, 0);
 
     ret = i2c_smbus_write_byte_data(client, MPU6050_PWR_MGMT_1_REG, MPU6050_PWR_MGMT_1_SLEEP);
     if (ret < 0) {
