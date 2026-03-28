@@ -781,3 +781,605 @@ Thêm `-static` vào CFLAGS trong Makefile.
 | ioctl | validate magic/nr + get_user/put_user + bitfield write | ✓ DONE |
 | uapi header | __KERNEL__ guard, dùng chung 2 phía | ✓ DONE |
 | test app | 5 test cases, static link, PASS/FAIL report | ✓ DONE |
+
+## Day 3: Interrupt-Driven Architecture & epoll Support
+
+---
+
+## Mục tiêu
+
+Chuyển từ kiến trúc **blocking read** (poll I2C trực tiếp) sang kiến trúc **Event-Driven Architecture (EDA)** — driver chỉ đọc data khi có interrupt từ MPU6050, user space dùng `epoll` để chờ event mà không tốn CPU.
+
+---
+
+## Phase 1: Tại sao cần thay đổi kiến trúc?
+
+### 1.1 Vấn đề với blocking read (Day 2)
+
+```
+User space:
+    while(1) {
+        read(fd, &data, sizeof(data))   ← gọi i2c trực tiếp, block luôn
+        process(data)
+        sleep(10ms)
+    }
+
+Driver read():
+    mutex_lock()
+    i2c_smbus_read_i2c_block_data()     ← đọc I2C mỗi lần user gọi
+    parse data
+    copy_to_user()
+    mutex_unlock()
+```
+
+Vấn đề:
+```
+CPU liên tục bận dù sensor chưa có data mới
+Latency không đảm bảo — user phải tự canh timing
+Không scale được — nhiều process cùng đọc gây conflict
+```
+
+### 1.2 Kiến trúc EDA với interrupt
+
+```
+MPU6050 có data mới → tự kéo INT pin xuống LOW
+    ↓
+GPIO detect FALLING edge → kernel gọi IRQ handler
+    ↓
+Driver đọc I2C trong threaded handler → lưu vào dev_data
+    ↓
+wake_up() → notify user space
+    ↓
+User space epoll_wait() return → gọi read()
+```
+
+Lợi ích:
+```
+CPU ngủ khi không có data             ← tiết kiệm điện
+Latency thấp và đảm bảo              ← hardware driven
+User space không cần biết timing      ← chờ event là đủ
+```
+
+---
+
+## Phase 2: Hardware — Cấu hình INT pin MPU6050
+
+### 2.1 Chọn GPIO pin trên BBB
+
+Dùng **P9_23** = `gpio1[17]` = GPIO số 49:
+
+```
+Tính GPIO number: bank × 32 + pin = 1 × 32 + 17 = 49
+
+Verify trên BBB:
+    cat /sys/kernel/debug/gpio | grep 49
+    → gpio-49 (P9_23) — không bị claim → free để dùng
+```
+
+### 2.2 Khai báo trong Device Tree
+
+```dts
+mpu6050: mpu6050@68 {
+    compatible = "invensense,mpu6050-custom";
+    reg = <0x68>;
+    interrupt-parent = <&gpio1>;
+    interrupts = <17 IRQ_TYPE_EDGE_FALLING>;
+};
+```
+
+Giải thích:
+```
+interrupt-parent = <&gpio1>         ← bank 1 (gpio1)
+interrupts = <17 IRQ_TYPE_EDGE_FALLING>
+              ↑   ↑
+              pin trigger type
+
+IRQ_TYPE_EDGE_FALLING = 0x02
+→ trigger khi INT pin chuyển từ HIGH xuống LOW
+```
+
+Verify sau khi compile và flash DTB:
+```bash
+dtc -I fs /sys/firmware/devicetree/base 2>/dev/null | grep -A6 mpu6050@68
+# Phải thấy: interrupts = <0x11 0x02>  (0x11=17, 0x02=EDGE_FALLING)
+```
+
+### 2.3 Hai register interrupt của MPU6050
+
+**INT_PIN_CFG (0x37) — cấu hình hành vi vật lý:**
+
+| Bit | Tên | Giá trị chọn | Lý do |
+|---|---|---|---|
+| 7 | INT_LEVEL | 1 = active LOW | khớp EDGE_FALLING |
+| 6 | INT_OPEN | 0 = push-pull | không cần external pull-up |
+| 5 | LATCH_INT_EN | 0 = pulse 50us | GPIO detect được |
+| 4 | INT_RD_CLEAR | 1 = clear khi đọc bất kỳ register | tự động clear |
+
+**INT_ENABLE (0x38) — bật nguồn interrupt:**
+
+| Bit | Tên | Giá trị | Ý nghĩa |
+|---|---|---|---|
+| 0 | DATA_RDY_EN | 1 | ngắt khi sensor ghi xong data mới |
+
+### 2.4 Tại sao EDGE_FALLING khớp với active LOW?
+
+```
+INT_LEVEL = 1  →  chip kéo pin xuống LOW khi có interrupt (active LOW)
+
+Timeline:
+HIGH ‾‾‾‾‾|_50us|‾‾‾‾‾
+           ↓
+        FALLING edge  ← CPU detect tại đây
+
+→ IRQ_TYPE_EDGE_FALLING hoàn toàn phù hợp
+```
+
+---
+
+## Phase 3: Thay đổi Data Structures
+
+### 3.1 Thêm vào `struct mpu6050dev_private_data`
+
+```c
+struct mpu6050dev_private_data {
+    struct i2c_client *client;
+    dev_t dev_num;
+    struct cdev cdev;
+    char buffer[14];
+    struct mutex lock;
+    wait_queue_head_t read_queue;   ← MỚI: chờ interrupt
+    struct device *device;
+    int irq_num;                    ← MỚI: lưu IRQ number
+    bool data_ready;                ← MỚI: cờ báo có data
+    struct mpu6050_data cooked_data; ← MỚI: data đã parse sẵn
+};
+```
+
+**Tại sao cần `wait_queue_head_t`?**
+
+```
+read() cần chờ đến khi có data mới
+poll() cần đăng ký với kernel để biết khi nào có data
+
+wait_queue là cơ chế kernel cho phép:
+    → process ngủ chờ condition
+    → interrupt handler đánh thức process
+    → epoll hook vào để nhận notification
+```
+
+**Tại sao cần `cooked_data` thay vì đọc trực tiếp trong read()?**
+
+```
+Day 2 (blocking):
+    read() → gọi I2C → parse → copy_to_user
+    ↑ đọc I2C trong file operation context
+
+Day 3 (interrupt-driven):
+    interrupt → threaded handler → gọi I2C → parse → lưu cooked_data
+    read()    → lấy cooked_data → copy_to_user
+    ↑ I2C chỉ được gọi trong interrupt thread context
+```
+
+---
+
+## Phase 4: Threaded IRQ — Top Half và Bottom Half
+
+### 4.1 Tại sao cần 2 handler?
+
+```
+Hard IRQ context (Top Half):
+    KHÔNG được: sleep, mutex_lock, I2C read
+    Phải xử lý cực nhanh
+    Chỉ làm việc tối thiểu
+
+Process context (Bottom Half / Threaded):
+    ĐƯỢC: sleep, mutex_lock, I2C read
+    Chạy như kernel thread thông thường
+```
+
+### 4.2 Primary handler (Top Half)
+
+```c
+static irqreturn_t mpu6050_primary_handler(int irq, void *dev_id) {
+    return IRQ_WAKE_THREAD;   ← chỉ đánh thức threaded handler
+}
+```
+
+`IRQ_WAKE_THREAD` báo kernel: "đánh thức threaded handler, tôi xong rồi".
+
+### 4.3 Threaded handler (Bottom Half)
+
+Thứ tự trong threaded handler:
+
+```
+1. mutex_lock()
+2. i2c_smbus_read_i2c_block_data() từ register 0x3B, 14 bytes
+3. Parse raw bytes → cooked_data
+4. mutex_unlock()
+5. data_ready = true
+6. wake_up_interruptible(&read_queue)
+7. return IRQ_HANDLED
+```
+
+**Quan trọng: `wake_up` phải nằm NGOÀI mutex:**
+
+```c
+mutex_unlock(&dev_data->lock);
+dev_data->data_ready = true;        ← ngoài mutex
+wake_up_interruptible(&read_queue); ← ngoài mutex
+```
+
+Lý do: nếu `wake_up` trong mutex → read() thức dậy → cố lock mutex → mutex vẫn bị handler giữ → unnecessary latency.
+
+### 4.4 `request_threaded_irq` — đăng ký cả 2 handler
+
+```c
+ret = request_threaded_irq(
+    client->irq,                    ← IRQ number từ Device Tree
+    mpu6050_primary_handler,        ← top half
+    mpu6050_threaded_handler,       ← bottom half
+    IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+    "mpu6050_event",
+    dev_data                        ← truyền vào handler qua dev_id
+);
+```
+
+`IRQF_ONESHOT` — bắt buộc với threaded IRQ: giữ interrupt disabled cho đến khi threaded handler hoàn thành, tránh interrupt storm.
+
+---
+
+## Phase 5: Thay đổi probe() — Thứ tự quan trọng
+
+### 5.1 Thứ tự đúng trong probe()
+
+```
+1.  devm_kzalloc()
+2.  dev_data->client = client       ← NGAY SAU ALLOC (tránh NULL ptr trong handler)
+3.  i2c_set_clientdata()
+4.  mutex_init(), init_waitqueue_head(), data_ready = false
+5.  WHO_AM_I verify
+6.  DEVICE_RESET + msleep(100)
+7.  Wake up + CLKSEL + msleep(10)
+8.  GYRO_CONFIG, ACCEL_CONFIG
+9.  SMPLRT_DIV → set sample rate (10Hz)
+10. CONFIG → set DLPF (42Hz bandwidth)
+11. INT_PIN_CFG → active LOW, INT_RD_CLEAR
+12. INT_ENABLE → DATA_RDY_EN = 1
+13. msleep(50)                      ← đợi chip stable trước khi IRQ active
+14. request_threaded_irq()          ← CUỐI CÙNG mới đăng ký IRQ
+15. cdev_init(), cdev_add()
+16. device_create()
+17. total_devices++
+```
+
+**Tại sao `client` phải gán trước `request_threaded_irq`?**
+
+```
+Nếu gán sau:
+    request_threaded_irq() → chip ngay lập tức fire interrupt
+    threaded handler chạy
+    i2c_smbus_read(..., dev_data->client, ...)
+                           ↑
+                           client = NULL → NULL pointer dereference → CRASH!
+```
+
+**Tại sao `request_threaded_irq` phải là cuối cùng (trước cdev)?**
+
+```
+INT_ENABLE = 1 → chip bắt đầu generate interrupt liên tục
+    ↓
+Phải đảm bảo handler đã sẵn sàng hoàn toàn trước khi interrupt đến
+    ↓
+client, lock, wait_queue phải đã init xong
+```
+
+### 5.2 Sample Rate và DLPF
+
+```
+SMPLRT_DIV (0x19):
+    Sample Rate = Gyro Output Rate / (1 + SMPLRT_DIV)
+    Gyro Output Rate = 1000Hz (khi DLPF enabled)
+    SMPLRT_DIV = 99 (0x63) → 1000 / (1 + 99) = 10Hz
+    → 10 interrupts mỗi giây → phù hợp để học
+
+CONFIG (0x1A) — DLPF:
+    0x03 → bandwidth 42Hz → lọc noise tốt hơn
+```
+
+### 5.3 Error handling khi fail sau request_threaded_irq
+
+```
+cdev_add fail:
+    free_irq(dev_data->irq_num, dev_data)   ← phải free IRQ
+    return ret
+
+device_create fail:
+    free_irq(dev_data->irq_num, dev_data)   ← phải free IRQ
+    cdev_del(&dev_data->cdev)
+    return ret
+```
+
+---
+
+## Phase 6: Thay đổi remove() — Thứ tự cleanup
+
+### 6.1 Thứ tự đúng trong remove()
+
+```
+1. i2c_smbus_write_byte_data(INT_ENABLE_REG, 0)  ← disable chip interrupt TRƯỚC
+2. sleep chip (best effort, không return nếu fail)
+3. free_irq()                                     ← free IRQ sau khi chip đã silent
+4. device_destroy()
+5. cdev_del()
+6. total_devices--
+```
+
+**Tại sao disable chip interrupt trước free_irq?**
+
+```
+Nếu free_irq trước khi disable chip:
+    chip vẫn đang generate interrupt
+    → interrupt đến trong khoảng free_irq đang chạy
+    → kernel xử lý spurious interrupt
+    → không crash nhưng không clean
+```
+
+---
+
+## Phase 7: Thay đổi read() — Chờ interrupt thay vì gọi I2C
+
+### 7.1 So sánh 2 kiến trúc
+
+**Day 2 — read() gọi I2C trực tiếp:**
+```c
+read() {
+    mutex_lock()
+    i2c_smbus_read_i2c_block_data()   ← gọi I2C ở đây
+    parse → copy_to_user
+    mutex_unlock()
+}
+```
+
+**Day 3 — read() chờ interrupt:**
+```c
+read() {
+    /* Hỗ trợ O_NONBLOCK */
+    if (O_NONBLOCK && !data_ready)
+        return -EAGAIN
+
+    /* Chờ interrupt đánh thức */
+    wait_event_interruptible(read_queue, data_ready)
+
+    /* Lấy data đã parse sẵn */
+    mutex_lock()
+    copy_to_user(cooked_data)
+    data_ready = false
+    mutex_unlock()
+}
+```
+
+### 7.2 `wait_event_interruptible` hoạt động như thế nào?
+
+```
+wait_event_interruptible(queue, condition):
+    if (condition đã true) → return ngay
+    else:
+        process ngủ trên queue
+        khi wake_up() được gọi → check condition lại
+        nếu condition true → return 0
+        nếu bị signal interrupt → return -ERESTARTSYS
+```
+
+### 7.3 O_NONBLOCK support
+
+```c
+if ((filp->f_flags & O_NONBLOCK) && !mpu6050dev_data->data_ready)
+    return -EAGAIN;
+```
+
+Dùng khi user space dùng `EPOLLET` (edge-triggered epoll):
+```
+Edge-triggered epoll → phải đọc hết data trong vòng lặp
+→ cần O_NONBLOCK để biết khi nào hết data (EAGAIN)
+```
+
+---
+
+## Phase 8: Implement `.poll` — Cầu nối với epoll
+
+### 8.1 Tại sao cần `.poll`?
+
+```
+read() blocking → user space bị block hoàn toàn
+    → không thể chờ nhiều fd cùng lúc
+
+poll()/select()/epoll() → user space chờ event không tốn CPU
+    → có thể chờ nhiều fd cùng lúc
+    → timeout linh hoạt
+```
+
+### 8.2 `.poll` làm đúng 2 việc
+
+```c
+__poll_t mpu6050_poll(struct file *filp, struct poll_table_struct *wait)
+{
+    unsigned int mask = 0;
+
+    /* Việc 1: đăng ký wait_queue với kernel poll mechanism */
+    poll_wait(filp, &dev_data->read_queue, wait);
+
+    /* Việc 2: báo cáo trạng thái hiện tại */
+    if (dev_data->data_ready)
+        mask |= POLLIN | POLLRDNORM;
+
+    return mask;
+}
+```
+
+**`poll_wait()` không phải là hàm ngủ** — nó nói với kernel:
+
+```
+"Nếu process cần chờ, hãy cho nó ngủ trên wait_queue này.
+ Khi wake_up() được gọi trên queue này → đánh thức process."
+```
+
+### 8.3 Flow hoàn chỉnh epoll ↔ driver
+
+```
+User:  epoll_wait(epfd, ...)
+           ↓
+Kernel gọi .poll() lần 1:
+    poll_wait()  ← kernel đăng ký ep_poll_callback vào wait_queue
+    data_ready = false → return 0
+           ↓
+Kernel cho process ngủ
+           ↓
+MPU6050 INT pin kéo LOW
+    → threaded handler đọc I2C
+    → data_ready = true
+    → wake_up_interruptible(&read_queue)
+           ↓
+kernel gọi ep_poll_callback() [epoll internal]
+    → gọi lại .poll() lần 2
+    → data_ready = true → return EPOLLIN
+    → thêm fd vào ready list
+           ↓
+epoll_wait() return
+    ↓
+User: read(fd, &data, sizeof(data))
+```
+
+**Driver không biết epoll tồn tại** — driver chỉ cần:
+- Implement `.poll()` với `poll_wait()`
+- Gọi `wake_up()` khi có data
+
+Kernel VFS tự kết nối hai phía.
+
+---
+
+## Phase 9: Debug — Interrupt Storm
+
+### 9.1 Nguyên nhân interrupt storm
+
+```
+I2C read fail trong threaded handler
+    ↓
+return IRQ_HANDLED nhưng INT_STATUS chưa được clear
+    ↓
+MPU6050 vẫn còn pending interrupt
+    ↓
+GPIO controller thấy signal → fire interrupt lại
+    ↓
+Handler chạy → fail → không clear → fire lại
+    ↓
+Vòng lặp vô hạn → RT throttling → board lag
+```
+
+### 9.2 Giải pháp — Đọc INT_STATUS trước
+
+```c
+/* Đầu threaded handler — clear interrupt TRƯỚC TIÊN */
+ret = i2c_smbus_read_byte_data(dev_data->client, MPU6050_INT_STATUS_REG);
+if (ret < 0) {
+    /* I2C lỗi nhưng interrupt vẫn phải được clear */
+    return IRQ_HANDLED;
+}
+
+/* Verify đúng là DATA_RDY */
+if (!(ret & MPU6050_INT_DATA_RDY))
+    return IRQ_HANDLED;
+
+/* Bây giờ mới đọc data */
+```
+
+### 9.3 Nguyên nhân NULL pointer dereference
+
+```
+Lỗi: dev_data->client = NULL khi threaded handler chạy
+
+Nguyên nhân:
+    request_threaded_irq() đăng ký IRQ
+    chip ngay lập tức fire interrupt
+    threaded handler chạy
+    i2c_smbus_read(dev_data->client) ← client chưa được gán!
+
+Fix: gán client TRƯỚC request_threaded_irq()
+```
+
+---
+
+## Phase 10: epoll trong User Space
+
+### 10.1 Level-triggered vs Edge-triggered
+
+```
+Level-triggered (mặc định):
+    epoll_wait báo khi buffer còn data
+    → an toàn, không bỏ sót
+    → phù hợp với driver MPU6050
+
+Edge-triggered (EPOLLET):
+    epoll_wait chỉ báo khi trạng thái thay đổi
+    → phải đọc hết data trong vòng lặp
+    → cần O_NONBLOCK + EAGAIN
+    → phức tạp hơn
+```
+
+### 10.2 Sử dụng epoll trong test app
+
+```c
+/* Setup epoll */
+int epfd = epoll_create1(0);
+struct epoll_event ev;
+ev.events  = EPOLLIN;          ← level-triggered
+ev.data.fd = fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+
+/* Event loop */
+struct epoll_event events[1];
+while (1) {
+    ret = epoll_wait(epfd, events, 1, 2000);  ← timeout 2s
+    if (ret == 0) { printf("timeout\n"); continue; }
+    if (ret < 0) { perror("epoll_wait"); break; }
+
+    if (events[0].events & EPOLLIN) {
+        read(fd, &data, sizeof(data));
+        process(data);
+    }
+}
+```
+
+---
+
+## Tổng kết — Checklist Day 3
+
+| Hạng mục | Chi tiết | Trạng thái |
+|---|---|---|
+| Chọn GPIO pin | P9_23 = gpio1[17] = GPIO49, free | ✓ DONE |
+| Device Tree | interrupt-parent + interrupts trong mpu6050 node | ✓ DONE |
+| INT_PIN_CFG | active LOW + INT_RD_CLEAR | ✓ DONE |
+| INT_ENABLE | DATA_RDY_EN = 1 | ✓ DONE |
+| dev_data thêm fields | wait_queue, irq_num, data_ready, cooked_data | ✓ DONE |
+| Primary handler | chỉ return IRQ_WAKE_THREAD | ✓ DONE |
+| Threaded handler | mutex + I2C read + parse + wake_up | ✓ DONE |
+| Thứ tự probe() | client gán trước request_irq, irq sau hardware config | ✓ DONE |
+| SMPLRT_DIV | 10Hz sample rate | ✓ DONE |
+| DLPF | 42Hz bandwidth filter | ✓ DONE |
+| remove() | disable chip irq → sleep → free_irq → cleanup | ✓ DONE |
+| read() | wait_event_interruptible + O_NONBLOCK | ✓ DONE |
+| .poll | poll_wait + check data_ready + POLLIN | ✓ DONE |
+| Error handling | free_irq khi cdev/device_create fail | ✓ DONE |
+| Debug interrupt storm | đọc INT_STATUS đầu handler | ✓ TODO |
+
+---
+
+## Bài học rút ra
+
+```
+1. Interrupt context có nhiều hạn chế → dùng threaded IRQ để làm I2C
+2. Thứ tự init trong probe() quan trọng → client trước, IRQ cuối
+3. Interrupt storm xảy ra khi không clear INT_STATUS
+4. wake_up() ngoài mutex → giảm latency
+5. .poll() = poll_wait() + bitmask → kernel tự kết nối với epoll
+6. Driver không cần biết epoll — chỉ cần wait_queue và wake_up()
+```
