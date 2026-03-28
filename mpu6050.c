@@ -37,6 +37,308 @@ struct mpu6050dev_private_data {
     bool data_ready;
     spinlock_t s_lock;
     struct mpu6050_data cooked_data;
+    u8 chip_id;
+    u8 gyro_range;
+    u8 accel_range;
+    u8 sample_rate;
+};
+
+static const u8 gyro_range_values[] = {
+    MPU6050_GYRO_CONFIG_FS_SEL_250,  
+    MPU6050_GYRO_CONFIG_FS_SEL_500,
+    MPU6050_GYRO_CONFIG_FS_SEL_1000, 
+    MPU6050_GYRO_CONFIG_FS_SEL_2000 
+};
+
+static const u8 accel_range_values[] = {
+    MPU6050_ACCEL_CONFIG_AFS_SEL_2,  
+    MPU6050_ACCEL_CONFIG_AFS_SEL_4,
+    MPU6050_ACCEL_CONFIG_AFS_SEL_8, 
+    MPU6050_ACCEL_CONFIG_AFS_SEL_16 
+};
+
+struct mpu6050_map {
+    int user_val;
+    u8 bit_val;
+};
+
+static const struct mpu6050_map gyro_table[] = {
+    {250,  0x00}, 
+    {500,  0x08}, 
+    {1000, 0x10}, 
+    {2000, 0x18}
+};
+
+static const struct mpu6050_map accel_table[] = {
+    {2,  0x00}, 
+    {4,  0x08}, 
+    {8,  0x10}, 
+    {16, 0x18}
+};
+
+/* Must be called with dev_data->lock held */
+static int mpu6050_write_reg_bitfield(struct i2c_client *client, u8 reg, u8 mask, u8 val)
+{
+    int ret;
+    u8 old_val, new_val;
+
+    /* 1. Đọc giá trị hiện tại từ thanh ghi */
+    ret = i2c_smbus_read_byte_data(client, reg);
+    if (ret < 0)
+        return ret;
+
+    old_val = (u8)ret;
+
+    /* 2. Tính toán giá trị mới: Xóa bit cũ bằng mask và OR với giá trị mới */
+    new_val = (old_val & ~mask) | (val & mask);
+
+    /* 3. Chỉ ghi lại nếu giá trị thực sự thay đổi (Tối ưu bus I2C) */
+    if (old_val == new_val)
+        return 0;
+
+    return i2c_smbus_write_byte_data(client, reg, new_val);
+}
+
+ssize_t chip_id_show(struct device *dev, struct device_attribute *attr,char *buf)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    return sprintf(buf, "0x%02x\n", dev_data->chip_id);
+}
+
+ssize_t temperature_show(struct device *dev, struct device_attribute *attr,char *buf)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int ret;
+    s16 temp_raw;
+    int temp_centi;
+
+    mutex_lock(&dev_data->lock);
+    ret = i2c_smbus_read_word_data(dev_data->client, MPU6050_TEMP_OUT_H_REG);
+    mutex_unlock(&dev_data->lock);
+    if (ret < 0) {
+        return ret;
+    }
+    temp_raw = (s16)be16_to_cpu((u16)ret);
+    temp_centi = ((int32_t)temp_raw * 100) / MPU6050_TEMP_SENSITIVITY  + MPU6050_TEMP_OFFSET;
+    return sprintf(buf,"%d\n", temp_centi);
+}
+
+ssize_t gyro_range_show(struct device *dev, struct device_attribute *attr,char *buf)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int ret, i;
+    u8 reg_val;
+
+    mutex_lock(&dev_data->lock);
+    ret = i2c_smbus_read_byte_data(dev_data->client, MPU6050_GYRO_CONFIG_REG);
+    mutex_unlock(&dev_data->lock);
+
+    if (ret < 0) return ret;
+
+    reg_val = ret & MPU6050_GYRO_CONFIG_FS_SEL_MASK;
+
+    for (i = 0; i < ARRAY_SIZE(gyro_table); i++) {
+        if (reg_val == gyro_table[i].bit_val)
+            return sprintf(buf, "%d\n", gyro_table[i].user_val);
+    }
+
+    return sprintf(buf, "unknown\n");
+}
+
+ssize_t gyro_range_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int user_input, ret, i;
+    u8 reg_val = 0xFF; 
+
+    ret = kstrtoint(buf, 0, &user_input);
+    if (ret) return ret;
+
+    for (i = 0; i < ARRAY_SIZE(gyro_table); i++) {
+        if (user_input == gyro_table[i].user_val) {
+            reg_val = gyro_table[i].bit_val;
+            break;
+        }
+    }
+
+    if (reg_val == 0xFF) {
+        dev_err(dev, "Invalid range: %d. Supported: 250, 500, 1000, 2000\n", user_input);
+        return -EINVAL; 
+    }
+
+    mutex_lock(&dev_data->lock);
+    ret = mpu6050_write_reg_bitfield(dev_data->client, 
+                                     MPU6050_GYRO_CONFIG_REG, 
+                                     MPU6050_GYRO_CONFIG_FS_SEL_MASK, 
+                                     reg_val);
+    mutex_unlock(&dev_data->lock);
+
+    if (ret < 0) return ret;
+
+    dev_info(dev, "Gyro range updated to %d°/s\n", user_input);
+
+    return count; 
+}
+
+ssize_t accel_range_show(struct device *dev, struct device_attribute *attr,char *buf)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int ret;
+    u8 reg_val;
+    int i;
+    mutex_lock(&dev_data->lock);
+    ret = i2c_smbus_read_byte_data(dev_data->client, MPU6050_ACCEL_CONFIG_REG);
+    mutex_unlock(&dev_data->lock);
+
+    if (ret < 0) return ret;
+
+    reg_val = ret & MPU6050_ACCEL_CONFIG_AFS_SEL_MASK;
+
+    for (i = 0; i < ARRAY_SIZE(accel_table); i++) {
+        if (reg_val == accel_table[i].bit_val)
+            return sprintf(buf, "%d\n", accel_table[i].user_val);
+    }
+
+    return sprintf(buf, "unknown\n");
+}
+
+ssize_t accel_range_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int user_input, ret, i;
+    u8 reg_val = 0xFF; 
+
+    ret = kstrtoint(buf, 0, &user_input);
+    if (ret) return ret;
+
+    for (i = 0; i < ARRAY_SIZE(accel_table); i++) {
+        if (user_input == accel_table[i].user_val) {
+            reg_val = accel_table[i].bit_val;
+            break;
+        }
+    }
+
+    if (reg_val == 0xFF) {
+        dev_err(dev, "Invalid range: %d. Supported: 2, 4, 8, 16\n", user_input);
+        return -EINVAL; 
+    }
+
+    mutex_lock(&dev_data->lock);
+    ret = mpu6050_write_reg_bitfield(dev_data->client, 
+                                     MPU6050_ACCEL_CONFIG_REG, 
+                                     MPU6050_ACCEL_CONFIG_AFS_SEL_MASK, 
+                                     reg_val);
+    mutex_unlock(&dev_data->lock);
+
+    if (ret < 0) return ret;
+
+    dev_info(dev, "Accel range updated to ±%dg\n", user_input);
+
+    return count; 
+}
+
+ssize_t sample_rate_show(struct device *dev, struct device_attribute *attr,char *buf)
+{
+struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int smplrt_div, config;
+    int gyro_out_rate;
+
+    mutex_lock(&dev_data->lock);
+    
+    /* 1. Đọc bộ chia SMPLRT_DIV */
+    smplrt_div = i2c_smbus_read_byte_data(dev_data->client, MPU6050_SMPRT_DIV_REG);
+    
+    /* 2. Đọc thanh ghi CONFIG để xem DLPF_CFG */
+    config = i2c_smbus_read_byte_data(dev_data->client, MPU6050_CONFIG_REG);
+    
+    mutex_unlock(&dev_data->lock);
+
+    if (smplrt_div < 0 || config < 0) return -EIO;
+
+    /* 3. Xác định Gyroscope Output Rate dựa trên DLPF_CFG (3 bit cuối) */
+    /* Nếu DLPF_CFG là 0 hoặc 7, rate là 8kHz, ngược lại là 1kHz */
+    if ((config & 0x07) == 0 || (config & 0x07) == 7)
+        gyro_out_rate = 8000;
+    else
+        gyro_out_rate = 1000;
+
+    /* 4. Tính toán theo công thức: Sample Rate = Gyro Rate / (1 + SMPLRT_DIV) */
+    return sprintf(buf, "%d\n", gyro_out_rate / (1 + (u8)smplrt_div));
+}
+
+ssize_t sample_rate_store(struct device *dev, struct device_attribute *attr,const char *buf, size_t count)
+{
+struct mpu6050dev_private_data *dev_data = dev_get_drvdata(dev);
+    int user_rate, gyro_out_rate, config, ret;
+    int div;
+
+    // 1. Parse giá trị người dùng nhập (Hz)
+    ret = kstrtoint(buf, 0, &user_rate);
+    if (ret) return ret;
+
+    // 2. Xác định Gyro Rate hiện tại (phụ thuộc DLPF)
+    mutex_lock(&dev_data->lock);
+    config = i2c_smbus_read_byte_data(dev_data->client, MPU6050_CONFIG_REG);
+    if (config < 0) {
+        mutex_unlock(&dev_data->lock);
+        return config;
+    }
+    
+    if ((config & 0x07) == 0 || (config & 0x07) == 7)
+        gyro_out_rate = 8000;
+    else
+        gyro_out_rate = 1000;
+
+    // 3. Tính toán SMPLRT_DIV ngược từ user_rate
+    // Công thức: DIV = (Gyro_Rate / User_Rate) - 1
+    if (user_rate <= 0) {
+        mutex_unlock(&dev_data->lock);
+        return -EINVAL; // Tần số phải dương
+    }
+    
+    div = (gyro_out_rate / user_rate) - 1;
+
+    // 4. Validate giá trị DIV (quan trọng nhất)
+    if (div < 0 || div > 255) {
+        dev_err(dev, "Sample rate %d Hz out of range for current gyro rate %d Hz\n", 
+                user_rate, gyro_out_rate);
+        mutex_unlock(&dev_data->lock);
+        return -EINVAL;
+    }
+
+    // 5. Ghi giá trị DIV hợp lệ vào thanh ghi
+    ret = i2c_smbus_write_byte_data(dev_data->client, MPU6050_SMPRT_DIV_REG, (u8)div);
+    mutex_unlock(&dev_data->lock);
+
+    return (ret < 0) ? ret : count;
+}
+
+static DEVICE_ATTR_RO(chip_id);
+static DEVICE_ATTR_RO(temperature);
+static DEVICE_ATTR_RW(gyro_range);
+static DEVICE_ATTR_RW(accel_range);
+static DEVICE_ATTR_RW(sample_rate);
+
+static struct attribute *mpu6050_attrs[] = 
+{
+	&dev_attr_chip_id.attr,
+	&dev_attr_temperature.attr,
+	&dev_attr_gyro_range.attr,
+    &dev_attr_accel_range.attr,
+    &dev_attr_sample_rate.attr,
+	NULL
+};
+
+static struct attribute_group mpu6050_attr_group =
+{
+	.attrs = mpu6050_attrs
+};
+
+static const struct attribute_group *mpu6050_attr_groups[] = 
+{
+	&mpu6050_attr_group,
+	NULL
+
 };
 
 struct mpu6050drv_private_data {
@@ -120,42 +422,8 @@ __poll_t mpu6050_poll(struct file *filp, struct poll_table_struct *wait) {
     return mask;
 }
 
-/* Must be called with dev_data->lock held */
-static int mpu6050_write_reg_bitfield(struct i2c_client *client, u8 reg, u8 mask, u8 val)
-{
-    int ret;
-    u8 old_val, new_val;
 
-    /* 1. Đọc giá trị hiện tại từ thanh ghi */
-    ret = i2c_smbus_read_byte_data(client, reg);
-    if (ret < 0)
-        return ret;
 
-    old_val = (u8)ret;
-
-    /* 2. Tính toán giá trị mới: Xóa bit cũ bằng mask và OR với giá trị mới */
-    new_val = (old_val & ~mask) | (val & mask);
-
-    /* 3. Chỉ ghi lại nếu giá trị thực sự thay đổi (Tối ưu bus I2C) */
-    if (old_val == new_val)
-        return 0;
-
-    return i2c_smbus_write_byte_data(client, reg, new_val);
-}
-
-static const u8 gyro_range_values[] = {
-    MPU6050_GYRO_CONFIG_FS_SEL_250,  
-    MPU6050_GYRO_CONFIG_FS_SEL_500,
-    MPU6050_GYRO_CONFIG_FS_SEL_1000, 
-    MPU6050_GYRO_CONFIG_FS_SEL_2000 
-};
-
-static const u8 accel_range_values[] = {
-    MPU6050_ACCEL_CONFIG_AFS_SEL_2,  
-    MPU6050_ACCEL_CONFIG_AFS_SEL_4,
-    MPU6050_ACCEL_CONFIG_AFS_SEL_8, 
-    MPU6050_ACCEL_CONFIG_AFS_SEL_16 
-};
 
 long mpu6050_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
@@ -215,28 +483,6 @@ long mpu6050_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
             MPU6050_PWR_MGMT_1_CLKSEL_PLL_X);
         break;
 
-    case MPU6050_IOC_SET_ACCEL_RANGE:
-        if (val > 3) {
-            ret = -EINVAL;
-            goto unlock_out;
-        }
-            ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client, 
-                                            MPU6050_ACCEL_CONFIG_REG, 
-                                            MPU6050_ACCEL_CONFIG_AFS_SEL_MASK, 
-                                            accel_range_values[val]);
-        break;
-
-    case MPU6050_IOC_SET_GYRO_RANGE:
-        if (val > 3) {
-            ret = -EINVAL;
-            goto unlock_out;
-        }
-            ret = mpu6050_write_reg_bitfield(mpu6050dev_data->client, 
-                                            MPU6050_GYRO_CONFIG_REG, 
-                                            MPU6050_GYRO_CONFIG_FS_SEL_MASK, 
-                                            gyro_range_values[val]);
-        break;
-
     case MPU6050_IOC_GET_CONFIG:
         ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_CONFIG_REG);
         if (ret < 0) goto unlock_out;
@@ -244,28 +490,6 @@ long mpu6050_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
             ret = -EFAULT;
             goto unlock_out;
         }
-        break;
-
-    case MPU6050_IOC_GET_ACCEL_RANGE:
-        ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_ACCEL_CONFIG_REG);
-        if (ret < 0) goto unlock_out;
-        val = (u8)((ret & MPU6050_ACCEL_CONFIG_AFS_SEL_MASK) >> 3);
-        if (put_user(val, (u8 __user *)arg)) {
-            ret = -EFAULT;
-            goto unlock_out;
-        }
-        ret = 0;
-        break;
-
-    case MPU6050_IOC_GET_GYRO_RANGE:
-        ret = i2c_smbus_read_byte_data(mpu6050dev_data->client, MPU6050_GYRO_CONFIG_REG);
-        if (ret < 0) goto unlock_out;
-        val = (u8) ((ret & MPU6050_GYRO_CONFIG_FS_SEL_MASK) >> 3);
-        if (put_user(val, (u8 __user *)arg)) {
-            ret = -EFAULT;
-            goto unlock_out;
-        }
-        ret = 0;
         break;
 
     default:
@@ -405,6 +629,8 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
         dev_err(&client->dev, "Device ID mismatch (0x%02x)\n", ret);
         return -ENODEV;
     }
+    dev_info(&client->dev, "Found MPU6050 chip ID: 0x%02x\n", ret);
+    dev_data->chip_id = (u8 )ret;
 
     ret = i2c_smbus_write_byte_data(client, MPU6050_PWR_MGMT_1_REG, MPU6050_PWR_MGMT_1_DEVICE_RESET); 
     if (ret < 0) {
@@ -489,9 +715,8 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
         free_irq(dev_data->irq_num, dev_data);
 		return ret;
 	}
-
-    dev_data->device = device_create(mpu6050_drv_data.class, dev, dev_data->dev_num,NULL,\
-								"mpu6050-%d", mpu6050_drv_data.total_devices);
+    dev_data->device = device_create_with_groups(mpu6050_drv_data.class, dev, dev_data->dev_num, dev_data, mpu6050_attr_groups,\
+                                "mpu6050-%d", mpu6050_drv_data.total_devices);
 	if(IS_ERR(dev_data->device)){
 		dev_err(dev,"Device create failed\n");
         free_irq(dev_data->irq_num, dev_data);
@@ -501,7 +726,6 @@ int mpu6050_i2c_driver_probe(struct i2c_client *client, const struct i2c_device_
 	}
 
     mpu6050_drv_data.total_devices++;
-
     dev_info(dev,"Probe was successful\n");
 
     return 0;
