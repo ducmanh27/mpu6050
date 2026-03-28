@@ -1,0 +1,33 @@
+{
+  "configurations": [
+    {
+      "name": "BBB Kernel Module (ARM)",
+
+      "compilerPath": "/home/dev/Workspace/Toolchain/gcc-arm-11.2-2022.02-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf-gcc",
+
+      "intelliSenseMode": "linux-gcc-arm",
+      "cStandard": "gnu89",
+      "cppStandard": "gnu++14",
+
+      "includePath": [
+        "${workspaceFolder}/**",
+
+        "/home/dev/Workspace/linux/include",
+        "/home/dev/Workspace/linux/arch/arm/include",
+        "/home/dev/Workspace/linux/arch/arm/include/generated",
+
+        "/home/dev/Workspace/linux/include/uapi",
+        "/home/dev/Workspace/linux/arch/arm/include/uapi",
+        "/home/dev/Workspace/linux/include/generated/uapi"
+      ],
+
+      "defines": [
+        "__KERNEL__",
+        "MODULE",
+        "CONFIG_ARM",
+        "CONFIG_64BIT=0"
+      ]
+    }
+  ],
+  "version": 4
+}
